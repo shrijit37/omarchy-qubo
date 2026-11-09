@@ -1,0 +1,327 @@
+#!/home/shrijit/.local/share/qubo-env/bin/python3
+"""Qubo Air Purifier Control & Telemetry CLI."""
+
+import argparse
+import asyncio
+import json
+import ssl
+import sys
+import time
+from pathlib import Path
+
+import paho.mqtt.client as mqtt
+from qubopy.auth import QuboAuth
+from qubopy.client import QuboClient
+from qubopy.exceptions import QuboError
+
+TOKEN_FILE = Path.home() / ".qubopy_session.json"
+MQTT_HOST = "mqtt.platform.quboworld.com"
+MQTT_PORT = 8883
+
+
+def _load_session():
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+async def get_client():
+    cached = _load_session()
+    if not cached or not cached.get("accessToken"):
+        return None
+    auth = QuboAuth()
+    auth.set_tokens(
+        access_token=cached["accessToken"],
+        refresh_token=cached.get("refreshToken"),
+        user_uuid=cached.get("uuid", ""),
+    )
+    return QuboClient(auth)
+
+
+async def find_purifier_info(client):
+    units = await client.get_units()
+    for u in units:
+        unit_uuid = u.get("unitUUID") or u.get("uuid") or u.get("id") or ""
+        devs = await client.get_devices_for_unit(unit_uuid)
+        for d in devs:
+            dtype = str(d.get("deviceType") or "").lower()
+            dname = str(d.get("deviceName") or "").lower()
+            dmodel = str(d.get("aModelNo") or d.get("deviceModel") or "").lower()
+            if "purifier" in dtype or "purifier" in dname or "hph" in dmodel:
+                return {
+                    "unit_uuid": d.get("unitUUID") or unit_uuid,
+                    "entity_uuid": d.get("entityUUID") or d.get("deviceUUID") or "",
+                    "device_uuid": d.get("deviceUUID") or d.get("deviceId") or "",
+                    "name": d.get("deviceName") or "Smart Air Purifier Q200",
+                    "model": d.get("aModelNo") or "HPH01A",
+                    "serial": d.get("serialNumber") or "",
+                    "mac": d.get("macAddress") or "",
+                    "online": bool(d.get("state") != 1 and not d.get("isDeleted")),
+                }
+    return None
+
+
+def send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, service, attributes):
+    """Publish real-time operational command to device via Qubo MQTT broker."""
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "command": {
+            "devices": {
+                "deviceUUID": device_uuid,
+                "handleName": user_uuid,
+                "services": {
+                    service: {
+                        "attributes": attributes,
+                        "instanceId": 0,
+                    }
+                },
+            },
+            "deviceUUID": device_uuid,
+            "msgSequenceId": now_ms,
+            "srcDeviceId": "qubo_desktop",
+            "timestamp": now_ms,
+        }
+    }
+
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"qubo_cli_{int(time.time() * 1000) % 100000}",
+    )
+    client.username_pw_set(username=user_uuid, password=token)
+    client.tls_set_context(ssl.create_default_context())
+
+    client.connect(MQTT_HOST, MQTT_PORT, 60)
+    client.loop_start()
+    time.sleep(0.3)
+
+    topic = f"/control/{unit_uuid}/{device_uuid}/{service}"
+    info = client.publish(topic, json.dumps(payload), qos=1)
+    info.wait_for_publish(timeout=5)
+
+    time.sleep(0.3)
+    client.loop_stop()
+    client.disconnect()
+    return info.rc == mqtt.MQTT_ERR_SUCCESS
+
+
+async def cmd_status():
+    client = await get_client()
+    if not client:
+        print(json.dumps({"authenticated": False, "error": "Not authenticated. Run 'qubopy login' first."}))
+        return 1
+
+    try:
+        async with client:
+            info = await find_purifier_info(client)
+            if not info:
+                print(json.dumps({"authenticated": True, "found": False, "error": "No Qubo Air Purifier found on account."}))
+                return 1
+
+            shadow = await client.get_device_shadow(
+                info["device_uuid"],
+                unit_uuid=info["unit_uuid"],
+                entity_uuid=info["entity_uuid"],
+            )
+            rep = shadow.reported or {}
+
+            raw_pwr = rep.get("lcSwitchControl", {}).get("power") or rep.get("lcSwitchControl_power") or "off"
+            is_on = str(raw_pwr).lower() == "on"
+
+            raw_pm25 = rep.get("aqiStatus", {}).get("PM25") or rep.get("aqiStatus_PM25") or 0
+            try:
+                pm25 = int(raw_pm25)
+            except (ValueError, TypeError):
+                pm25 = 0
+
+            raw_speed = rep.get("fanSpeedControl", {}).get("speed") or rep.get("fanSpeedControl_speed") or 1
+            try:
+                fan_speed = int(raw_speed)
+            except (ValueError, TypeError):
+                fan_speed = 1
+
+            mode = str(rep.get("fanControlMode", {}).get("state") or rep.get("fanControlMode_state") or "auto").lower()
+
+            raw_fl = rep.get("filterReset", {}).get("percentage") or rep.get("filterReset_percentage") or 100
+            try:
+                filter_life = int(raw_fl)
+            except (ValueError, TypeError):
+                filter_life = 100
+
+            filter_hours = str(rep.get("filterReset", {}).get("timeRemaining") or rep.get("filterReset_timeRemaining") or "")
+            child_lock = str(rep.get("childLockControl", {}).get("state") or rep.get("childLockControl_state") or "disable").lower() == "enable"
+            light_on = str(rep.get("lightControl", {}).get("state") or rep.get("lightControl_state") or "on").lower() == "on"
+            dimmer = str(rep.get("dimmerControlAP", {}).get("state") or rep.get("dimmerControlAP_state") or "high")
+            fw_version = str(rep.get("mcuSWVersion", {}).get("version") or rep.get("mcuSWVersion_version") or "")
+
+            usage = rep.get("purifierUsage") or {}
+            avg_pm25 = str(usage.get("avgPM25") or rep.get("purifierUsage_avgPM25") or "")
+            min_pm25 = str(usage.get("minPM25") or rep.get("purifierUsage_minPM25") or "")
+            max_pm25 = str(usage.get("maxPM25") or rep.get("purifierUsage_maxPM25") or "")
+            total_usage_mins = str(usage.get("totalUsages") or rep.get("purifierUsage_totalUsages") or "")
+
+            wifi = rep.get("wifiSettings") or {}
+            ip_addr = str(wifi.get("ipAddress") or rep.get("wifiSettings_ipAddress") or rep.get("ip_address") or "192.168.1.3")
+            ssid = str(wifi.get("SSIDName") or rep.get("wifiSettings_SSIDName") or rep.get("wifi_ssid") or "")
+            rssi = str(wifi.get("signalStrength") or rep.get("wifiSettings_signalStrength") or rep.get("signal_strength") or "")
+            station = str(rep.get("outdoorStationIds", {}).get("stationName") or rep.get("outdoorStationIds_stationName") or "")
+
+            cache_dir = Path.home() / ".cache" / "qubo-purifier"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            history_file = cache_dir / "history.json"
+            history_points = []
+            if history_file.exists():
+                try:
+                    with open(history_file, "r", encoding="utf-8") as hf:
+                        history_points = json.load(hf)
+                except Exception:
+                    history_points = []
+            now_sec = int(time.time())
+            if not history_points or (now_sec - history_points[-1]["t"]) >= 15:
+                history_points.append({"t": now_sec, "v": pm25})
+                history_points = history_points[-100:]
+                try:
+                    with open(history_file, "w", encoding="utf-8") as hf:
+                        json.dump(history_points, hf)
+                except Exception:
+                    pass
+
+            result = {
+                "authenticated": True,
+                "found": True,
+                "name": info["name"],
+                "model": info["model"],
+                "serial": info["serial"],
+                "device_id": info["device_uuid"],
+                "mac": info["mac"],
+                "online": True,
+                "power": is_on,
+                "pm25": pm25,
+                "fan_speed": fan_speed,
+                "mode": mode,
+                "filter_life": filter_life,
+                "filter_hours": filter_hours,
+                "child_lock": child_lock,
+                "light_on": light_on,
+                "dimmer": dimmer,
+                "firmware": fw_version,
+                "avg_pm25": avg_pm25,
+                "min_pm25": min_pm25,
+                "max_pm25": max_pm25,
+                "total_usage_mins": total_usage_mins,
+                "ip_address": ip_addr,
+                "ssid": ssid,
+                "rssi": rssi,
+                "outdoor_station": station,
+                "history": history_points,
+            }
+            print(json.dumps(result))
+            return 0
+    except Exception as e:
+        print(json.dumps({"authenticated": True, "error": str(e)}))
+        return 1
+
+
+async def cmd_action(action, value=None):
+    cached = _load_session()
+    if not cached or not cached.get("accessToken"):
+        print(json.dumps({"success": False, "error": "Not authenticated. Run 'qubopy login' first."}))
+        return 1
+
+    token = cached["accessToken"]
+    user_uuid = cached.get("uuid", "")
+
+    client = await get_client()
+    try:
+        async with client:
+            info = await find_purifier_info(client)
+            if not info:
+                print(json.dumps({"success": False, "error": "No Qubo Air Purifier found."}))
+                return 1
+
+            unit_uuid = info["unit_uuid"]
+            device_uuid = info["device_uuid"]
+
+            if action == "toggle":
+                shadow = await client.get_device_shadow(device_uuid, unit_uuid=unit_uuid, entity_uuid=info["entity_uuid"])
+                rep = shadow.reported or {}
+                raw_pwr = rep.get("lcSwitchControl", {}).get("power") or rep.get("lcSwitchControl_power") or "off"
+                curr_on = str(raw_pwr).lower() == "on"
+                target_state = "off" if curr_on else "on"
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "lcSwitchControl", {"power": target_state})
+                print(json.dumps({"success": ok, "power": target_state == "on"}))
+
+            elif action in ("on", "off"):
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "lcSwitchControl", {"power": action})
+                print(json.dumps({"success": ok, "power": action == "on"}))
+
+            elif action == "speed":
+                speed_str = str(int(value))
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "fanSpeedControl", {"speed": speed_str})
+                print(json.dumps({"success": ok, "fan_speed": int(speed_str)}))
+
+            elif action == "mode":
+                mode_str = str(value).lower()
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "fanControlMode", {"state": mode_str})
+                print(json.dumps({"success": ok, "mode": mode_str}))
+
+            elif action == "child_lock":
+                target_state = "enable" if value in (True, "enable", "on", 1) else "disable"
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "childLockControl", {"state": target_state})
+                print(json.dumps({"success": ok, "child_lock": target_state == "enable"}))
+
+            elif action == "light":
+                target_state = "on" if value in (True, "on", 1) else "off"
+                ok = send_mqtt_command(user_uuid, token, unit_uuid, device_uuid, "lightControl", {"state": target_state})
+                print(json.dumps({"success": ok, "light_on": target_state == "on"}))
+
+            return 0
+    except Exception as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Qubo Air Purifier CLI Control")
+    subparsers = parser.add_subparsers(dest="cmd")
+
+    subparsers.add_parser("status", help="Get status JSON")
+    subparsers.add_parser("toggle", help="Toggle power")
+    subparsers.add_parser("on", help="Turn power on")
+    subparsers.add_parser("off", help="Turn power off")
+
+    speed_p = subparsers.add_parser("speed", help="Set fan speed (1-3)")
+    speed_p.add_argument("level", type=int, choices=[1, 2, 3], help="Speed level 1-3")
+
+    mode_p = subparsers.add_parser("mode", help="Set mode (auto, sleep, manual)")
+    mode_p.add_argument("mode_name", type=str, choices=["auto", "sleep", "manual"], help="Mode name")
+
+    lock_p = subparsers.add_parser("childlock", help="Toggle child lock (enable/disable)")
+    lock_p.add_argument("state", type=str, choices=["enable", "disable"], help="enable or disable")
+
+    light_p = subparsers.add_parser("light", help="Toggle light (on/off)")
+    light_p.add_argument("state", type=str, choices=["on", "off"], help="on or off")
+
+    args = parser.parse_args()
+
+    if args.cmd == "status" or args.cmd is None:
+        sys.exit(asyncio.run(cmd_status()))
+    elif args.cmd in ("toggle", "on", "off"):
+        sys.exit(asyncio.run(cmd_action(args.cmd)))
+    elif args.cmd == "speed":
+        sys.exit(asyncio.run(cmd_action("speed", args.level)))
+    elif args.cmd == "mode":
+        sys.exit(asyncio.run(cmd_action("mode", args.mode_name)))
+    elif args.cmd == "childlock":
+        sys.exit(asyncio.run(cmd_action("child_lock", args.state)))
+    elif args.cmd == "light":
+        sys.exit(asyncio.run(cmd_action("light", args.state)))
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

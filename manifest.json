@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "qubo.purifier",
+  "name": "Qubo Air Purifier",
+  "version": "1.1.0",
+  "author": "Omarchy",
+  "license": "MIT",
+  "description": "Control Qubo air purifiers and monitor live AQI directly from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Qubo Air Purifier",
+    "description": "Speed, mode, child lock, and live AQI for Qubo Q200.",
+    "category": "Home",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,18 @@
+# Virtualenv
+.venv/
+qubo-env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Credentials and secrets
+*.session.json
+.qubopy_session.json
+tokens.json
+
+# Cache and local runtime
+.cache/
+*.log
+*.qslog
