@@ -531,9 +531,9 @@ Panel {
           ChipsRow {
             width: parent.width
             bar: root.bar
-            actionable: root.power
-            label: "Speed"
-            captionWidth: Style.space(54)
+            actionable: root.power && root.mode !== "auto"
+            label: root.mode === "auto" ? "Speed (Auto)" : "Speed"
+            captionWidth: Style.space(80)
             options: [
               { value: "1", label: "1 (Low)" },
               { value: "2", label: "2 (Mid)" },
